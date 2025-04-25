@@ -1,0 +1,342 @@
+close all
+clear all
+
+
+
+%%*****STEP 0: Set the hyper-parameters of the model
+
+bool_use_preprocessed_data=1; %if =1 use preprocessed data and model parameters from the test Hawai'i dataset
+                              %if =0 re-process the raw data
+                              %NB: If a new dataset is used the following functions must be adapted by the user: Create_SimulationGrid_fromGeoRaster; read_fileData_Hawaii; Plot_coastline; initialize_climate_divisions; Get_MonthlyData                              
+                              %Step 1.4 could also be modify to specify distinct training and test periods
+
+%Parameters for model calibration
+nb_max_days=800; %To boost inference: maximum nb of days used to infer the covariance parameters for a given rain type
+nb_max_dryGauges=10; %To boost inference: maximum nb of dry gauges for a given day used to infer the covariance parameters for a given rain type
+
+%Parameters for unconditional simulation
+nb_realiz_SimulUncondi_byType=4000;
+
+%Parameters for conditional simulation
+my_year=2018;
+my_month=10;
+nb_VirtualStations=200; 
+nb_realiz_SimulCondi=100; 
+
+%Parameters for Metropolis with Gibbs (conditioning to monthly totals)
+nb_iter_MwG=500;
+                              
+
+
+%*****STEP 1: Load, format, and gapfill Rainfall Data*****
+if bool_use_preprocessed_data==0
+
+%----------STEP 1.1: create simulation grid (from monthly rainfall maps)
+    cd('BI_MONTHLY_2018-2020')
+    my_year=2019;
+    my_month=2;
+    my_file=strcat(num2str(my_year),'_',num2str(my_month,'%02d'),'_bi_rf_mm.tif');
+    [A,R]=readgeoraster(my_file);
+    cd('..')
+
+    step_simulation_grid=0.02;
+    [V_X_SimulationGrid,V_Y_SimulationGrid,V_convert_simgrid,dimX_simGrid,dimY_simGrid,Xmin_simGrid,Xmax_simGrid,Ymin_simGrid,Ymax_simGrid]=Create_SimulationGrid_fromGeoRaster(A,R,step_simulation_grid);
+
+%----------STEP 1.2: load daily rainfall data
+    [V_Time,M_Data,V_Lon,V_Lat,~]=read_fileData_Hawaii('Partial_Filled_Daily_RF_mm.csv');
+    M_datevec=datevec(V_Time);
+    V_datetime=datetime(M_datevec);
+
+%----------STEP 1.3: Gap filling
+    [M_Data_gapfilled,V_Lon_gapfilled,V_Lat_gapfilled]=Gapfilling_VectorSampling(M_Data,V_Lon,V_Lat,0.75);
+
+    V_inds_gaugesToKeep=[]; %extract dataset to keep
+    for i=1:length(V_Lon)
+        my_ind=find(V_Lon(i)==V_Lon_gapfilled & V_Lat(i)==V_Lat_gapfilled);
+        if ~isempty(my_ind)
+            V_inds_gaugesToKeep=[V_inds_gaugesToKeep;i];
+        end
+    end
+    M_Data=M_Data(V_inds_gaugesToKeep,:);
+    V_Lon=V_Lon(V_inds_gaugesToKeep);
+    V_Lat=V_Lat(V_inds_gaugesToKeep);
+    clear V_Lat_gapfilled V_Lon_gapfilled
+
+    [inds_decluster]=Decluster_GaugeNetwork(2,V_Lon,V_Lat,Xmin_simGrid,Xmax_simGrid,Ymin_simGrid,Ymax_simGrid); %2km gridcell declustering
+    M_Data=M_Data(inds_decluster,:);
+    M_Data_gapfilled=M_Data_gapfilled(inds_decluster,:);
+    V_Lon=V_Lon(inds_decluster);
+    V_Lat=V_Lat(inds_decluster);
+else
+    cd('Preprocess_Paper_Reproducibility\')
+    load('V_Lon.mat')
+    load('V_Lat.mat')
+    load('V_datetime.mat')
+    load('M_datevec.mat')
+    load('M_Data_gapfilled.mat')
+    load('A.mat')
+    load('R.mat')
+    cd('..')
+    step_simulation_grid=0.02;
+    [V_X_SimulationGrid,V_Y_SimulationGrid,V_convert_simgrid,dimX_simGrid,dimY_simGrid,Xmin_simGrid,Xmax_simGrid,Ymin_simGrid,Ymax_simGrid]=Create_SimulationGrid_fromGeoRaster(A,R,step_simulation_grid);
+end
+
+%----------STEP 1.4: Split dataset into training and test periods (here training and test on the same period encompassing the whole dataset)
+inds_training=1:size(M_Data_gapfilled,2);
+inds_test=1:size(M_Data_gapfilled,2);
+
+M_Data_Training=M_Data_gapfilled(:,inds_training);
+M_datevec_Training=M_datevec(inds_training,:);
+
+M_Data_Test=M_Data_gapfilled(:,inds_test);
+M_datevec_Test=M_datevec(inds_test,:);
+
+
+
+%*****STEP 2: Cluster days into Rain Types*****
+
+if bool_use_preprocessed_data==0
+    
+%----------STEP 2.1: Decluster rain gauges before typing (20 km gridcell for the island of Hawai'i)
+    [inds_decluster]=Decluster_GaugeNetwork(20,V_Lon,V_Lat,Xmin_simGrid,Xmax_simGrid,Ymin_simGrid,Ymax_simGrid);
+
+%----------STEP 2.2: Rain Typing
+    inds_data_typing=inds_training;
+    [M_Data_latent_forTyping,V_p0_ini,V_k_ini,V_teta_ini]=ComputeLatentValues(M_Data_gapfilled(inds_decluster,inds_data_typing),V_Lon(inds_decluster),V_Lat(inds_decluster));
+    [M_EigenVect_training,M_PCs_ini]=KL_Transform(M_Data_latent_forTyping,[]);
+
+    nb_clusters=6;
+    [V_RainTypes,my_GMModel]=RainTyping(V_p0_ini,V_k_ini,V_teta_ini,M_PCs_ini,nb_clusters);
+    V_RainTypes_Test=V_RainTypes;
+    V_RainTypes_Training=V_RainTypes;
+else
+    cd('Preprocess_Paper_Reproducibility\')
+    load('V_RainTypes.mat')
+    cd('..')
+    nb_clusters=6;
+    V_RainTypes_Test=V_RainTypes;
+    V_RainTypes_Training=V_RainTypes;
+end
+
+%----------STEP 2.3: Display rain types statistics
+num_fig=1;
+SubScript_Plot_RainTypes_Statistics
+
+
+
+%*****STEP 3: inference of model parameters*****
+
+if bool_use_preprocessed_data==0
+
+%----------Step 3.1: Fit marginal model at observation locations
+    nb_param_marginal=3;
+    M_ParamMarginal_ObsSites=NaN(size(M_Data_Training,1),nb_param_marginal,nb_clusters);
+
+    for my_type=1:nb_clusters
+        inds_days=find(V_RainTypes_Training==my_type);
+        M_Data_type=M_Data_Training(:,inds_days);
+
+        for my_gauge=1:size(M_Data_type,1)
+            display(strcat(num2str(my_type),' : ',num2str(my_gauge)))
+            V_data_gauge=M_Data_type(my_gauge,:);
+            inds_nan=isnan(V_data_gauge);
+            V_data_gauge(inds_nan)=[];
+
+            [V_Par]=Fit_Marginal(V_data_gauge);
+
+            for i=1:nb_param_marginal
+                M_ParamMarginal_ObsSites(my_gauge,i,my_type)=V_Par(i);
+            end
+        end
+    end
+
+else
+    cd('Preprocess_Paper_Reproducibility\')
+    load('M_ParamMarginal_ObsSites.mat')
+    nb_param_marginal=3;
+    cd('..')
+end
+
+%----------Step 3.2: Compute latent values at observation locations (non-zero rain only)
+
+M_Data_latent_Training=NaN(size(M_Data_Training));
+for my_type=1:nb_clusters
+    inds_days=find(V_RainTypes_Training==my_type);
+    for my_day=1:length(inds_days)
+        [V_Y]=Transform_R_to_Y(M_Data_Training(:,inds_days(my_day)),M_ParamMarginal_ObsSites(:,1,my_type),M_ParamMarginal_ObsSites(:,2,my_type),M_ParamMarginal_ObsSites(:,3,my_type));
+        M_Data_latent_Training(:,inds_days(my_day))=V_Y;
+    end
+end
+
+if bool_use_preprocessed_data==0
+
+%----------Step 3.3: Fit covariance parameters for each climate zone (i.e., area with locally stationary covariance structure)
+
+    %Define climate zone (here climate divisions ad hoc for the Island of Hawai'i)
+    [nb_climate_division,M_inds_neighboors_ClimateDivisions,V_X_ClimateDivisions,V_Y_ClimateDivisions]=initialize_climate_divisions(V_Lat,V_Lon);
+
+    %Estimation of covariance based on maximum-likelihood
+    M_ParamsMatern_ClimateDivisions=NaN(nb_clusters,nb_climate_division,5);
+    
+    for my_type=1:nb_clusters
+        my_type
+        for my_ClimDiv=1:nb_climate_division
+            my_ClimDiv
+            inds_type=find(V_RainTypes_Training==my_type);
+            inds_ClimDiv=M_inds_neighboors_ClimateDivisions( my_ClimDiv,:);
+            inds_ClimDiv=inds_ClimDiv(~isnan(inds_ClimDiv));
+            [gamma1,gamma2,rho2,nu,LL_Matern]=EstimateLocalMaternCovariance(M_Data_latent_Training(inds_ClimDiv,inds_type),V_Lat(inds_ClimDiv),V_Lon(inds_ClimDiv),M_ParamMarginal_ObsSites(inds_ClimDiv,1,my_type),nb_max_days,nb_max_dryGauges);
+            M_ParamsMatern_ClimateDivisions(my_type,my_ClimDiv,1)=gamma1;
+            M_ParamsMatern_ClimateDivisions(my_type,my_ClimDiv,2)=gamma2;
+            M_ParamsMatern_ClimateDivisions(my_type,my_ClimDiv,3)=rho2;
+            M_ParamsMatern_ClimateDivisions(my_type,my_ClimDiv,4)=nu;
+            M_ParamsMatern_ClimateDivisions(my_type,my_ClimDiv,5)=0.0;
+        end
+    end
+
+    M_ParamCovariance_ObsSites=NaN(length(V_Lon),6,5); %Assign Covariance parameters to Observation locations
+    for my_type=1:nb_clusters
+        for my_param=1:5
+            M_ParamCovariance_ObsSites(inds_Windward_Kohala,my_type,my_param)=M_ParamsMatern_ClimateDivisions(my_type,1,my_param);
+            M_ParamCovariance_ObsSites(inds_Leeward_Kohala,my_type,my_param)=M_ParamsMatern_ClimateDivisions(my_type,2,my_param);
+            M_ParamCovariance_ObsSites(inds_Kona,my_type,my_param)=M_ParamsMatern_ClimateDivisions(my_type,3,my_param);
+            M_ParamCovariance_ObsSites(inds_Kau,my_type,my_param)=M_ParamsMatern_ClimateDivisions(my_type,4,my_param);
+            M_ParamCovariance_ObsSites(inds_Hilo,my_type,my_param)=M_ParamsMatern_ClimateDivisions(my_type,5,my_param);
+            M_ParamCovariance_ObsSites(inds_Mauka,my_type,my_param)=M_ParamsMatern_ClimateDivisions(my_type,6,my_param);
+        end
+    end
+
+else
+    cd('Preprocess_Paper_Reproducibility\')
+    load('M_ParamsMatern_ClimateDivisions.mat')
+    load('M_ParamCovariance_ObsSites.mat')
+    load('V_X_ClimateDivisions.mat')
+    load('V_Y_ClimateDivisions.mat')
+    cd('..')
+end
+
+%----------Step 3.4: Display model parameters
+
+V_X_ObsSites=V_Lon*111;
+V_Y_ObsSites=V_Lat*111;
+V_X_SimulationPoints=[V_X_SimulationGrid;V_Lon*111];
+V_Y_SimulationPoints=[V_Y_SimulationGrid;V_Lat*111];
+[M_ParamMarginal_SimulationPoints,M_ParamCovariance_SimulationPoints]=Interp_ModelParameters(V_X_ObsSites,V_Y_ObsSites,M_ParamMarginal_ObsSites,M_ParamCovariance_ObsSites,V_X_SimulationPoints,V_Y_SimulationPoints);
+num_fig=9;
+SubScript_PlotModelParams; %Plot interpolated model parameters
+
+
+
+%*****STEP 4: Stochastic simulation*****
+
+%----------Step 4.1: Pre-processing
+
+%Get locations for the Virtual Stations and extract their monthly precipitation amount
+[V_X_MonthlyCondi,V_Y_MonthlyCondi,V_Obs_MonthlyCondi]=Get_MonthlyData(my_year,my_month,V_X_ObsSites,V_Y_ObsSites,V_X_SimulationGrid,V_Y_SimulationGrid,nb_VirtualStations);
+
+%Interpolate model parameters at a set of locations encompassing: (1) The simulation grid, (2) the virtual stations, and (3) the rain gauges
+V_X_Tot=[V_X_SimulationGrid;V_X_MonthlyCondi;V_Lon*111];
+V_Y_Tot=[V_Y_SimulationGrid;V_Y_MonthlyCondi;V_Lat*111];
+[M_ParamMarginal_Tot,M_ParamCovariance_Tot]=Interp_ModelParameters(V_X_ObsSites,V_Y_ObsSites,M_ParamMarginal_ObsSites,M_ParamCovariance_ObsSites,V_X_Tot,V_Y_Tot);
+
+%----------Step 4.2: Unconditional simulation
+
+M_SimulUncondi_latent_allTypes=NaN(length(V_X_Tot),nb_realiz_SimulUncondi_byType,nb_clusters);
+
+for my_type=1:nb_clusters
+    my_type
+    [M_SimulUncondi_latent_type]=StochasticSimulation_NonStationaryGaussianField(my_type,V_X_Tot,V_Y_Tot,M_ParamCovariance_Tot,nb_realiz_SimulUncondi_byType);
+    M_SimulUncondi_latent_allTypes(:,:,my_type)=M_SimulUncondi_latent_type;
+end
+
+%----------Step 4.3: Simulate pseudo-observations
+
+%Gibbs sampler simulation of pseudo-observations for censored latent values (i.e., dry observations by rain gauges)
+inds_days_month=find(M_datevec_Test(:,1)==my_year & M_datevec_Test(:,2)==my_month);
+M_Data_Month=M_Data_Test(:,inds_days_month);
+V_RainTypes_Month=V_RainTypes(inds_days_month);
+
+M_Data_Month_latent=NaN(size(M_Data_Month));
+for my_type=1:nb_clusters
+    inds_days=find(V_RainTypes_Month==my_type);
+    for my_day=1:length(inds_days)
+        [V_Y]=Transform_R_to_Y(M_Data_Month(:,inds_days(my_day)),M_ParamMarginal_ObsSites(:,1,my_type),M_ParamMarginal_ObsSites(:,2,my_type),M_ParamMarginal_ObsSites(:,3,my_type));
+        M_Data_Month_latent(:,inds_days(my_day))=V_Y;
+    end
+end
+[M_Data_Month_latent]=Simulate_CensoredValues_Gibbs(M_Data_Month_latent,V_X_ObsSites,V_Y_ObsSites,M_ParamCovariance_ObsSites,M_ParamMarginal_ObsSites,V_RainTypes_Month); %Simulate censored latent values by Gibbs sampling
+
+%Metropolis within Gibbs simulation of pseudo-observations at virtual stations locations
+V_X_PseudoObsSites=[V_X_MonthlyCondi;V_Lon*111];
+V_Y_PseudoObsSites=[V_Y_MonthlyCondi;V_Lat*111];
+[M_ParamMarginal_PseudoObs,M_ParamCovariance_PseudoObs]=Interp_ModelParameters(V_X_ObsSites,V_Y_ObsSites,M_ParamMarginal_ObsSites,M_ParamCovariance_ObsSites,V_X_PseudoObsSites,V_Y_PseudoObsSites);
+
+[M_Data_Month_latent_MwG,~]=Metropolis_within_Gibbs(inds_days_month,M_Data_Month_latent,V_RainTypes_Month,V_X_PseudoObsSites,V_Y_PseudoObsSites,V_Obs_MonthlyCondi,M_ParamMarginal_PseudoObs,M_ParamCovariance_PseudoObs,V_X_ObsSites,V_Y_ObsSites,M_ParamCovariance_ObsSites,nb_realiz_SimulCondi,nb_iter_MwG);
+
+%----------Step 4.4: Conditional simulation = rainfall mapping
+
+%----------Step 4.4.1: Daily rainfall mapping based on daily rain gauge observations only
+
+%Set-up simulation locations and extract model parameters
+V_X_SimulCondi_DailyOnly=[V_X_SimulationGrid;V_Lon*111];
+V_Y_SimulCondi_DailyOnly=[V_Y_SimulationGrid;V_Lat*111];
+inds_SimulCondi_DailyOnly=[1:length(V_X_SimulationGrid) length(V_X_SimulationGrid)+length(V_X_MonthlyCondi)+1:length(V_X_SimulationGrid)+length(V_X_MonthlyCondi)+length(V_Lon)];
+[M_ParamMarginal_SimulCondi_DailyOnly,M_ParamCovariance_SimulCondi_DailyOnly]=Interp_ModelParameters(V_X_ObsSites,V_Y_ObsSites,M_ParamMarginal_ObsSites,M_ParamCovariance_ObsSites,V_X_SimulCondi_DailyOnly,V_Y_SimulCondi_DailyOnly);
+
+M_SimulCondi_DailyOnly=NaN(length(V_X_SimulationGrid),nb_realiz_SimulCondi,length(inds_days_month)); %Simulate only on SimulationGrid
+for my_day=1:length(inds_days_month) 
+    my_day
+    my_type=V_RainTypes_Month(my_day);
+
+    if my_type>0
+        %get the pre-processed unconditional simulation
+        inds=randperm(nb_realiz_SimulCondi);
+        M_SimulUncondi_latent_day=M_SimulUncondi_latent_allTypes(inds_SimulCondi_DailyOnly,inds,my_type);
+
+        %conditioning to latent observations (i.e. in the latent world)
+        V_condi_data_latent=M_Data_Month_latent(:,my_day);
+        [M_simul_condi_latent]=Conditioning_GaussianSimul_toPseudoObs(my_type,M_SimulUncondi_latent_day,V_X_SimulCondi_DailyOnly,V_Y_SimulCondi_DailyOnly,M_ParamCovariance_SimulCondi_DailyOnly,V_X_ObsSites,V_Y_ObsSites,M_ParamCovariance_ObsSites,V_condi_data_latent);
+
+        %Back-transform
+        M_simul_condi_day=NaN(length(V_X_SimulationGrid),nb_realiz_SimulCondi); %NB: here the size is the one of SimulationGrid (do not account for conditioning locations embeded in M_simul_condi_latent)
+        for my_realiz=1:nb_realiz_SimulCondi
+            V_Y=M_simul_condi_latent(:,my_realiz);
+            [V_R]=Transform_Y_to_R(V_Y,M_ParamMarginal_SimulCondi_DailyOnly(:,my_type,1),M_ParamMarginal_SimulCondi_DailyOnly(:,my_type,2),M_ParamMarginal_SimulCondi_DailyOnly(:,my_type,3));
+            M_simul_condi_day(:,my_realiz)=V_R(1:length(V_X_SimulationGrid));
+        end
+        M_SimulCondi_DailyOnly(:,:,my_day)=M_simul_condi_day;
+    end
+end
+
+%----------Step 4.4.2: Daily rainfall mapping based on daily rain gauge observations and monthly totals
+M_SimulCondi_MwG=NaN(length(V_X_SimulationGrid),nb_realiz_SimulCondi,length(inds_days_month)); %Simulate only on SimulationGrid
+for my_day=1:31
+    my_day
+    ind_target_day=find(M_datevec_Test(:,1)==my_year & M_datevec_Test(:,2)==my_month & M_datevec_Test(:,3)==my_day);
+
+    %unconditional simulation (pre-computed to save time)
+    my_type=V_RainTypes_Test(ind_target_day);
+    if my_type>0
+        %get unconditional simulations
+        inds=randperm(nb_realiz_SimulUncondi_byType);
+        inds=inds(1:nb_realiz_SimulCondi);
+        M_SimulUncondi_latent_day=M_SimulUncondi_latent_allTypes(:,inds,my_type);
+
+        %Conditioning
+        M_condi_data_latent=reshape(M_Data_Month_latent_MwG(:,my_day,:),[size(M_Data_Month_latent_MwG,1) nb_realiz_SimulCondi]);
+        [M_simul_condi_latent]=Conditioning_GaussianSimul_toPseudoObs(my_type,M_SimulUncondi_latent_day,V_X_Tot,V_Y_Tot,M_ParamCovariance_Tot,V_X_PseudoObsSites,V_Y_PseudoObsSites,M_ParamCovariance_PseudoObs,M_condi_data_latent);
+        M_simul_condi=NaN(length(V_X_SimulationGrid),nb_realiz_SimulCondi);
+        for my_realiz=1:nb_realiz_SimulCondi
+            %Back-transform
+            V_Y=M_simul_condi_latent(:,my_realiz);
+            [V_R]=Transform_Y_to_R(V_Y,M_ParamMarginal_Tot(:,my_type,1),M_ParamMarginal_Tot(:,my_type,2),M_ParamMarginal_Tot(:,my_type,3));
+            M_simul_condi(:,my_realiz)=V_R(1:length(V_X_SimulationGrid));
+        end
+        M_SimulCondi_MwG(:,:,my_day)=M_simul_condi;
+    end
+    
+end
+
+%----------Step 4.5: Display daily rainfall maps
+SubScript_plotCondi_Monthly
+
